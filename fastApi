@@ -1,0 +1,201 @@
+Here’s a minimal FastAPI app that exposes an OpenAI-compatible POST /v1/chat/completions endpoint.
+
+It ignores your real backend for now and just replies:
+
+> Your question was: ...
+
+
+
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Union, Literal, Any
+import json
+import time
+import uuid
+
+app = FastAPI(title="OpenWebUI Test Backend")
+
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"] = "user"
+    content: Union[str, List[Any]]
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "test-rag"
+    messages: List[Message]
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "test-rag",
+                "object": "model",
+                "owned_by": "local-fastapi"
+            }
+        ]
+    }
+
+
+def extract_latest_user_text(messages: List[Message]) -> str:
+    for message in reversed(messages):
+        if message.role == "user":
+            if isinstance(message.content, str):
+                return message.content
+            if isinstance(message.content, list):
+                parts = []
+                for item in message.content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+                return " ".join(parts).strip()
+    return ""
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: ChatCompletionRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    # Optional API key check:
+    # expected = "Bearer my-secret-key"
+    # if authorization != expected:
+    #     raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_text = extract_latest_user_text(request.messages)
+    answer = f"Your question was: {user_text}"
+
+    if not request.stream:
+        return JSONResponse(
+            {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": answer,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+        )
+
+    async def event_stream():
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        words = answer.split()
+
+        for word in words:
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": word + " "},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        final_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+Run it with:
+
+pip install fastapi uvicorn
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+If your file is named main.py, test it here:
+
+curl http://localhost:8000/health
+
+Then test the chat endpoint:
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "test-rag",
+    "messages": [
+      {"role": "user", "content": "Hello from OpenWebUI"}
+    ],
+    "stream": false
+  }'
+
+You should get a response like:
+
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "test-rag",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Your question was: Hello from OpenWebUI"
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+
+To connect it to Open WebUI:
+
+add a new OpenAI-compatible connection
+
+base URL: http://localhost:8000/v1
+
+model: test-rag
+
+
+If Open WebUI is running in Docker, use something like:
+
+http://host.docker.internal:8000/v1
+
+Once this works, replace:
+
+answer = f"Your question was: {user_text}"
+
+with your real RAG pipeline.
+
+I can also give you a second version with API key auth and Docker Compose for Open WebUI + FastAPI together.
