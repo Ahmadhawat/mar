@@ -1,0 +1,967 @@
+Agreed — those are the right fixes.
+
+Here’s a cleaned-up, production-ready `reranker_service.py` that includes:
+
+* one model loaded at startup
+* a global prediction lock
+* real `top_k` slicing
+* chunked scoring instead of building all pairs at once
+* request limits
+* Pydantic validation
+* honest health status
+* progress bar disabled
+
+```python
+from __future__ import annotations
+
+import os
+import re
+import threading
+from contextlib import contextmanager
+from typing import Dict, Iterable, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
+from sentence_transformers import CrossEncoder
+
+try:
+    import torch
+    INFERENCE_CTX = torch.inference_mode
+except Exception:
+    @contextmanager
+    def INFERENCE_CTX():
+        yield
+
+
+# ---------------- deployment / safety limits ----------------
+
+MAX_CANDIDATES = int(os.getenv("RERANK_MAX_CANDIDATES", "50"))
+MAX_BATCH_SIZE = int(os.getenv("RERANK_MAX_BATCH_SIZE", "64"))
+MAX_TOP_K = int(os.getenv("RERANK_MAX_TOP_K", "20"))
+MAX_TEXT_CHARS = int(os.getenv("RERANK_MAX_TEXT_CHARS", "20000"))
+MAX_WINDOW_TOKENS = int(os.getenv("RERANK_MAX_WINDOW_TOKENS", "512"))
+MAX_WINDOWS_PER_DOC = int(os.getenv("RERANK_MAX_WINDOWS_PER_DOC", "20"))
+
+MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+DEVICE = os.getenv("RERANK_DEVICE", "cpu")
+
+PREDICT_LOCK = threading.Lock()
+
+app = FastAPI(title="CrossEncoder Reranker Service")
+model: Optional[CrossEncoder] = None
+
+
+# ---------------- helpers ----------------
+
+def clean_text(text: str) -> str:
+    """Fix PDF hyphenation and collapse ugly newlines while keeping paragraphs."""
+    t = text.replace("-\n", "")
+    t = t.replace("\r", "\n")
+    t = "\n".join(line.strip() for line in t.splitlines())
+    t = "\n\n".join(p for p in t.split("\n\n") if p.strip())
+    return t
+
+
+def make_windows(text: str, approx_tokens: int, max_windows: Optional[int] = None) -> List[str]:
+    """
+    Split into sentence-ish windows of about approx_tokens words
+    with one-sentence overlap.
+    """
+    sents = re.split(r"(?<=[.!?:;])\s+", text)
+    blocks: List[str] = []
+    cur: List[str] = []
+    wc = 0
+
+    for s in sents:
+        if not s.strip():
+            continue
+
+        cur.append(s)
+        wc += len(s.split())
+
+        if wc >= approx_tokens:
+            blocks.append(" ".join(cur))
+            cur = cur[-1:]
+            wc = len(cur[-1].split())
+
+            if max_windows is not None and len(blocks) >= max_windows:
+                break
+
+    if cur and (max_windows is None or len(blocks) < max_windows):
+        blocks.append(" ".join(cur))
+
+    return blocks or [text]
+
+
+def de_query_variants(q: str) -> List[str]:
+    """Tiny German compound expansion; aggregate by MAX to preserve precision."""
+    variants = [q]
+    ql = q.lower()
+    extra: List[str] = []
+
+    if "querprofil" in ql:
+        extra += [
+            "Querprofillinie",
+            "Querprofillinien",
+            "Querschnittsprofil",
+            "Querprofil-Linie",
+        ]
+    if "station" in ql or "achsstation" in ql:
+        extra += ["Achsstation", "Stationierung", "Stationen"]
+    if "plot" in ql or "plotten" in ql:
+        extra += ["zeichnen", "darstellen", "plot", "erstellen"]
+
+    if extra:
+        variants.append(q + " (" + ", ".join(extra[:6]) + ")")
+
+    return variants
+
+
+def norm(values: Iterable[float]) -> List[float]:
+    vals = [float(x) for x in values]
+    if not vals:
+        return vals
+    mn, mx = min(vals), max(vals)
+    rng = mx - mn
+    return [(x - mn) / (rng + 1e-9) for x in vals]
+
+
+def score_candidate(
+    *,
+    model: CrossEncoder,
+    qvars: List[str],
+    text: str,
+    batch_size: int,
+    window_tokens: int,
+    max_windows_per_doc: Optional[int],
+) -> float:
+    """
+    Score one candidate by taking MAX over:
+      query variants x text windows
+
+    Scoring is chunked to avoid building huge `pairs` lists.
+    """
+    windows = make_windows(
+        clean_text(text),
+        approx_tokens=window_tokens,
+        max_windows=max_windows_per_doc,
+    )
+
+    best_score = float("-inf")
+    buffer: List[tuple[str, str]] = []
+
+    for qv in qvars:
+        for w in windows:
+            buffer.append((qv, w))
+            if len(buffer) >= batch_size:
+                scores = model.predict(
+                    buffer,
+                    batch_size=len(buffer),
+                    show_progress_bar=False,
+                )
+                best_score = max(best_score, float(max(scores)))
+                buffer.clear()
+
+    if buffer:
+        scores = model.predict(
+            buffer,
+            batch_size=len(buffer),
+            show_progress_bar=False,
+        )
+        best_score = max(best_score, float(max(scores)))
+
+    return best_score
+
+
+# ---------------- API models ----------------
+
+class CandidateIn(BaseModel):
+    chunkpath: str = Field(default="")
+    chunk_name: str = Field(default="")
+    text: str = Field(min_length=1)
+    rrf_score: float = Field(default=0.0)
+    file_txt: str = Field(default="")
+    file_path_html: str = Field(default="")
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Candidate text must not be empty.")
+        if len(v) > MAX_TEXT_CHARS:
+            v = v[:MAX_TEXT_CHARS]
+        return v
+
+
+class RerankRequest(BaseModel):
+    query: str = Field(min_length=1)
+    candidates: List[CandidateIn] = Field(min_length=1, max_length=MAX_CANDIDATES)
+    alpha: float = Field(default=0.65, ge=0.0, le=1.0)
+    batch_size: int = Field(default=32, ge=1, le=MAX_BATCH_SIZE)
+    window_tokens: int = Field(default=180, ge=20, le=MAX_WINDOW_TOKENS)
+    max_windows_per_doc: Optional[int] = Field(default=6, ge=1, le=MAX_WINDOWS_PER_DOC)
+    top_k: int = Field(default=10, ge=1, le=MAX_TOP_K)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Query must not be empty.")
+        return v
+
+
+class RankedResult(BaseModel):
+    chunkpath: str
+    chunk_name: str
+    file_txt: str
+    file_path_html: str
+    ce_score: float
+    blended_score: float
+    rrf_score: float
+
+
+class RerankResponse(BaseModel):
+    query: str
+    model: str
+    alpha: float
+    results: List[RankedResult]
+
+
+# ---------------- lifecycle ----------------
+
+@app.on_event("startup")
+def startup_event() -> None:
+    global model
+    model = CrossEncoder(MODEL_NAME, max_length=512, device=DEVICE)
+    print(f"[reranker] loaded model={MODEL_NAME} device={DEVICE}")
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {
+        "status": "ok" if model is not None else "not_ready",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+# ---------------- main endpoint ----------------
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(req: RerankRequest) -> RerankResponse:
+    global model
+
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+
+    if len(req.candidates) > MAX_CANDIDATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many candidates. Max allowed is {MAX_CANDIDATES}.",
+        )
+
+    qvars = de_query_variants(req.query)
+    retriever_scores = [c.rrf_score for c in req.candidates]
+    ce_scores: List[float] = []
+
+    # Serialize access to model.predict(...) for one-model / one-GPU stability.
+    with PREDICT_LOCK:
+        with INFERENCE_CTX():
+            for cand in req.candidates:
+                ce_score = score_candidate(
+                    model=model,
+                    qvars=qvars,
+                    text=cand.text,
+                    batch_size=req.batch_size,
+                    window_tokens=req.window_tokens,
+                    max_windows_per_doc=req.max_windows_per_doc,
+                )
+                ce_scores.append(ce_score)
+
+    ce_n = norm(ce_scores)
+    ret_n = norm(retriever_scores)
+    blended = [
+        req.alpha * c + (1.0 - req.alpha) * r
+        for c, r in zip(ce_n, ret_n)
+    ]
+
+    order = sorted(range(len(req.candidates)), key=lambda i: blended[i], reverse=True)
+
+    ranked = [
+        RankedResult(
+            chunkpath=req.candidates[i].chunkpath,
+            chunk_name=req.candidates[i].chunk_name,
+            file_txt=req.candidates[i].file_txt,
+            file_path_html=req.candidates[i].file_path_html,
+            ce_score=ce_scores[i],
+            blended_score=blended[i],
+            rrf_score=req.candidates[i].rrf_score,
+        )
+        for i in order[:req.top_k]
+    ]
+
+    return RerankResponse(
+        query=req.query,
+        model=MODEL_NAME,
+        alpha=req.alpha,
+        results=ranked,
+    )
+```
+
+Your client can stay almost the same. The main thing is to make sure it sends only the fields the service needs.
+
+Here’s a solid client version:
+
+```python
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+import requests
+
+
+class RerankerClient:
+    def __init__(self, base_url: str = "http://127.0.0.1:8020", timeout: int = 300):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def health(self) -> Dict[str, Any]:
+        r = requests.get(f"{self.base_url}/health", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        alpha: float = 0.65,
+        batch_size: int = 32,
+        window_tokens: int = 180,
+        max_windows_per_doc: Optional[int] = 6,
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        payload = {
+            "query": query,
+            "candidates": candidates,
+            "alpha": alpha,
+            "batch_size": batch_size,
+            "window_tokens": window_tokens,
+            "max_windows_per_doc": max_windows_per_doc,
+            "top_k": top_k,
+        }
+        r = requests.post(
+            f"{self.base_url}/rerank",
+            json=payload,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+```
+
+For deployment, run it with a single worker so you do not duplicate the model:
+
+```bash
+uvicorn reranker_service:app --host 0.0.0.0 --port 8020 --workers 1
+```
+
+And in your old pipeline config:
+
+```yaml
+rerank:
+  service_url: "http://127.0.0.1:8020"
+  alpha: 0.65
+  batch_size: 32
+  ce_top_n: 25
+  window_tokens: 180
+  max_windows_per_doc: 6
+  top_k: 10
+```
+
+Two practical notes:
+
+* `top_k` now applies at the service response level, so the client receives only the top results.
+* min-max normalization is still request-relative, which is usually fine for reranking within one candidate set.
+
+I can next rewrite your original `CrossEncoderReranking.run()` so it calls this service cleanly and fits your exact `ctx.artifacts` structure.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                        A good way to do this is to turn the reranker into a long-lived worker process that loads the `CrossEncoder` once, then accepts rerank requests from your existing pipeline.
+
+The cleanest version is:
+
+* **new process**: `reranker_service.py`
+
+  * starts once
+  * loads model once
+  * waits for requests
+  * reranks and returns results
+
+* **old code**: `CrossEncoderClient.py` or small helper inside your current pipeline
+
+  * sends query + candidates to the service
+  * receives reranked output
+  * never loads the model itself
+
+You can do this with HTTP using FastAPI, or with sockets / subprocess pipes. Since your project already seems to have `fastAPI.py`, HTTP is probably the easiest and most maintainable.
+
+---
+
+## Recommended architecture
+
+### 1. New standalone reranker service
+
+It should:
+
+* load the model at startup
+* expose an endpoint like `/rerank`
+* receive:
+
+  * query
+  * candidate chunks
+  * retriever scores
+  * config knobs like `alpha`, `window_tokens`, etc.
+* return:
+
+  * ranked results
+  * scores
+  * sorted paths / metadata
+
+### 2. Existing pipeline becomes a client
+
+Your old `run()` method should:
+
+* read hybrid results JSON
+* prepare candidate data
+* call the service
+* write `reranked_results.json`
+* store `ctx.artifacts[...]`
+
+That removes model loading from the main process.
+
+---
+
+# New standalone service
+
+## `reranker_service.py`
+
+```python
+from __future__ import annotations
+
+import os
+import re
+from typing import Dict, Iterable, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import CrossEncoder
+
+try:
+    import torch
+    INFERENCE_CTX = torch.inference_mode
+except Exception:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def INFERENCE_CTX():
+        yield
+
+
+# ---------------- helpers ----------------
+
+def clean_text(text: str) -> str:
+    """Fix PDF hyphenation and collapse ugly newlines while keeping paragraphs."""
+    t = text.replace("-\n", "")
+    t = t.replace("\r", "\n")
+    t = "\n".join(line.strip() for line in t.splitlines())
+    t = "\n\n".join(p for p in t.split("\n\n") if p.strip())
+    return t
+
+
+def make_windows(text: str, approx_tokens: int, max_windows: Optional[int] = None) -> List[str]:
+    """
+    Split into sentence-ish windows ~approx_tokens words with small overlap.
+    If max_windows is set, cap the number of windows.
+    """
+    sents = re.split(r"(?<=[.!?:;])\s+", text)
+    blocks, cur, wc = [], [], 0
+
+    for s in sents:
+        cur.append(s)
+        wc += len(s.split())
+        if wc >= approx_tokens:
+            blocks.append(" ".join(cur))
+            cur, wc = cur[-1:], len(cur[-1].split())
+            if max_windows is not None and len(blocks) >= max_windows:
+                break
+
+    if cur and (max_windows is None or len(blocks) < max_windows):
+        blocks.append(" ".join(cur))
+
+    return blocks or [text]
+
+
+def de_query_variants(q: str) -> List[str]:
+    """Tiny German compound expansion; aggregate by MAX."""
+    variants = [q]
+    ql = q.lower()
+    extra: List[str] = []
+
+    if "querprofil" in ql:
+        extra += ["Querprofillinie", "Querprofillinien", "Querschnittsprofil", "Querprofil-Linie"]
+    if "station" in ql or "achsstation" in ql:
+        extra += ["Achsstation", "Stationierung", "Stationen"]
+    if "plot" in ql or "plotten" in ql:
+        extra += ["zeichnen", "darstellen", "plot", "erstellen"]
+
+    if extra:
+        variants.append(q + " (" + ", ".join(extra[:6]) + ")")
+
+    return variants
+
+
+def norm(a: Iterable[float]) -> List[float]:
+    vals = [float(x) for x in a]
+    if not vals:
+        return vals
+    mn, mx = min(vals), max(vals)
+    rng = mx - mn
+    return [(x - mn) / (rng + 1e-9) for x in vals]
+
+
+# ---------------- API models ----------------
+
+class CandidateIn(BaseModel):
+    chunkpath: str
+    chunk_name: str = ""
+    text: str
+    rrf_score: float = 0.0
+    file_txt: str = ""
+    file_path_html: str = ""
+
+
+class RerankRequest(BaseModel):
+    query: str
+    candidates: List[CandidateIn]
+    alpha: float = 0.65
+    batch_size: int = 32
+    window_tokens: int = 180
+    max_windows_per_doc: Optional[int] = 6
+    top_k: int = 10
+
+
+class RankedResult(BaseModel):
+    chunkpath: str
+    chunk_name: str
+    file_txt: str
+    file_path_html: str
+    ce_score: float
+    blended_score: float
+    rrf_score: float
+
+
+class RerankResponse(BaseModel):
+    query: str
+    model: str
+    alpha: float
+    results: List[RankedResult]
+
+
+# ---------------- app ----------------
+
+MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+DEVICE = os.getenv("RERANK_DEVICE", "cpu")
+
+app = FastAPI(title="CrossEncoder Reranker Service")
+
+model: Optional[CrossEncoder] = None
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    global model
+    model = CrossEncoder(MODEL_NAME, max_length=512, device=DEVICE)
+    print(f"[reranker] loaded model={MODEL_NAME} device={DEVICE}")
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(req: RerankRequest) -> RerankResponse:
+    global model
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="Query is required.")
+
+    if not req.candidates:
+        return RerankResponse(
+            query=req.query,
+            model=MODEL_NAME,
+            alpha=req.alpha,
+            results=[],
+        )
+
+    qvars = de_query_variants(req.query)
+    ce_scores: List[float] = []
+    retriever_scores = [c.rrf_score for c in req.candidates]
+
+    with INFERENCE_CTX():
+        for c in req.candidates:
+            wt = make_windows(
+                clean_text(c.text),
+                approx_tokens=req.window_tokens,
+                max_windows=req.max_windows_per_doc,
+            )
+            pairs = [(qv, w) for qv in qvars for w in wt]
+            scores = model.predict(pairs, batch_size=req.batch_size)
+            ce_scores.append(float(max(scores)))
+
+    ce_n = norm(ce_scores)
+    ret_n = norm(retriever_scores)
+    blended = [req.alpha * c + (1.0 - req.alpha) * r for c, r in zip(ce_n, ret_n)]
+
+    order = sorted(range(len(req.candidates)), key=lambda i: blended[i], reverse=True)
+
+    ranked = [
+        RankedResult(
+            chunkpath=req.candidates[i].chunkpath,
+            chunk_name=req.candidates[i].chunk_name,
+            file_txt=req.candidates[i].file_txt,
+            file_path_html=req.candidates[i].file_path_html,
+            ce_score=ce_scores[i],
+            blended_score=blended[i],
+            rrf_score=req.candidates[i].rrf_score,
+        )
+        for i in order
+    ]
+
+    return RerankResponse(
+        query=req.query,
+        model=MODEL_NAME,
+        alpha=req.alpha,
+        results=ranked,
+    )
+```
+
+---
+
+# Run the service
+
+```bash
+uvicorn reranker_service:app --host 127.0.0.1 --port 8001
+```
+
+You start it once.
+Then it keeps the model in memory.
+
+---
+
+# Client code for your old pipeline
+
+## `reranker_client.py`
+
+```python
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+import requests
+
+
+class RerankerClient:
+    def __init__(self, base_url: str = "http://127.0.0.1:8001", timeout: int = 300):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def health(self) -> Dict[str, Any]:
+        r = requests.get(f"{self.base_url}/health", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        alpha: float = 0.65,
+        batch_size: int = 32,
+        window_tokens: int = 180,
+        max_windows_per_doc: int | None = 6,
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        payload = {
+            "query": query,
+            "candidates": candidates,
+            "alpha": alpha,
+            "batch_size": batch_size,
+            "window_tokens": window_tokens,
+            "max_windows_per_doc": max_windows_per_doc,
+            "top_k": top_k,
+        }
+        r = requests.post(f"{self.base_url}/rerank", json=payload, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+```
+
+---
+
+# Refactor your old `CrossEncoderReranking.run()`
+
+Your current code should stop loading `CrossEncoder` directly.
+Instead, it prepares the input and calls the service.
+
+## Example replacement version
+
+```python
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, List
+
+from src.search_steps.impls.reranking.CrerankingABS import Reranking
+from src.pipeline.context import Context
+from src.search_steps.impls.vector_search.CVectorSearchV1 import (
+    chunk_to_real_path,
+    chunk_to_real_txt,
+)
+from src.search_steps.impls.reranking.reranker_client import RerankerClient
+
+
+class CrossEncoderReranking(Reranking):
+    name = "cross_encoder_rerank"
+
+    def run(self, ctx: Context) -> None:
+        log = ctx.log.getChild(self.name)
+
+        cfg = ctx.cfg
+        paths = cfg["paths"]
+        hybrid_json_path = Path(paths["hybrid_results_path"])
+        source_html_root = Path(paths["source_html_root"])
+        source_txt_root = Path(paths["source_txt_root"])
+
+        rerank_cfg: Dict[str, object] = cfg.get("rerank", {})
+        alpha = float(rerank_cfg.get("alpha", 0.65))
+        batch_size = int(rerank_cfg.get("batch_size", 32))
+        ce_top_n = int(rerank_cfg.get("ce_top_n", 25))
+        window_tokens = int(rerank_cfg.get("window_tokens", 180))
+        max_windows_per_doc = rerank_cfg.get("max_windows_per_doc", 6)
+        max_windows_per_doc = None if max_windows_per_doc in (None, 0) else int(max_windows_per_doc)
+        top_k = int(rerank_cfg.get("top_k", 10))
+        reranker_url = str(rerank_cfg.get("service_url", "http://127.0.0.1:8001"))
+
+        query = (
+            ctx.artifacts.get("corrected_query")
+            or cfg.get("query", {}).get("text", "")
+            or ""
+        )
+        if not query.strip():
+            raise ValueError("cfg.query.text is required for cross-encoder rerank.")
+
+        log.info(f"Using query: {query}")
+        log.info(f"Loading results from: {hybrid_json_path}")
+
+        with hybrid_json_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        raw_results: List[Dict] = list(data.get("results", []))
+        if not raw_results:
+            log.warning("No results to rerank; exiting.")
+            return
+
+        raw_results.sort(key=lambda r: float(r.get("rrf_score", 0.0)), reverse=True)
+        raw_results = raw_results[:max(1, ce_top_n)]
+
+        candidates = []
+        for r in raw_results:
+            chunk_path = Path(r.get("chunkpath", ""))
+            if not chunk_path.exists():
+                log.warning(f"Chunk file not found: {chunk_path}")
+                continue
+
+            text = chunk_path.read_text(encoding="utf-8", errors="ignore").strip()
+
+            candidates.append(
+                {
+                    "chunkpath": str(chunk_path),
+                    "chunk_name": str(r.get("chunk_name", "")),
+                    "text": text,
+                    "rrf_score": float(r.get("rrf_score", 0.0)),
+                    "file_txt": chunk_to_real_txt(str(r.get("chunk_name", "")), source_txt_root or None),
+                    "file_path_html": chunk_to_real_path(str(r.get("chunk_name", "")), source_html_root or None),
+                }
+            )
+
+        if not candidates:
+            log.warning("No readable chunks; exiting.")
+            return
+
+        client = RerankerClient(base_url=reranker_url)
+        result = client.rerank(
+            query=query,
+            candidates=candidates,
+            alpha=alpha,
+            batch_size=batch_size,
+            window_tokens=window_tokens,
+            max_windows_per_doc=max_windows_per_doc,
+            top_k=top_k,
+        )
+
+        ranked_results = result["results"]
+
+        for rank, item in enumerate(ranked_results[:max(10, top_k)], 1):
+            log.info(
+                f"Rank {rank}: {item['chunkpath']} "
+                f"(CE: {item['ce_score']:.6f}, blended: {item['blended_score']:.6f})"
+            )
+
+        out = {
+            "query": result["query"],
+            "model": result["model"],
+            "alpha": result["alpha"],
+            "results": ranked_results,
+        }
+
+        sorted_chunkpaths = [r["chunkpath"] for r in ranked_results]
+        sorted_file_htmls = [r["file_path_html"] for r in ranked_results]
+
+        ctx.artifacts["rerank_files_html"] = sorted_file_htmls
+        ctx.artifacts["rerank_chunks_paths"] = sorted_chunkpaths
+
+        out_path = hybrid_json_path.with_name("reranked_results.json")
+        out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info(f"Wrote: {out_path}")
+```
+
+---
+
+# What changed
+
+In your old code, these parts disappear from the pipeline process:
+
+* `_CE_CACHE`
+* `_load_model()`
+* direct `CrossEncoder(...)`
+* `model.predict(...)`
+
+Those move into the new service.
+
+Your old code becomes:
+
+* file reading
+* request preparation
+* calling the service
+* writing results
+
+---
+
+# Why this is better
+
+This gives you:
+
+* **model loads once**
+* **main pipeline stays lighter**
+* **multiple rerank requests can reuse same process**
+* **easy to deploy on another machine later**
+* **you can restart reranker independently**
+
+---
+
+# Important design note
+
+Do **not** send file paths only and ask the reranker service to read your local files unless both processes are guaranteed to share the same filesystem.
+
+Best practice is what I used above:
+
+* old code reads text from chunk files
+* old code sends raw text to the service
+
+That makes the service independent and cleaner.
+
+---
+
+# Config example
+
+You can extend your YAML like this:
+
+```yaml
+rerank:
+  service_url: "http://127.0.0.1:8001"
+  alpha: 0.65
+  batch_size: 32
+  ce_top_n: 25
+  window_tokens: 180
+  max_windows_per_doc: 6
+  top_k: 10
+```
+
+And for the service environment:
+
+```bash
+export RERANK_MODEL_NAME="BAAI/bge-reranker-v2-m3"
+export RERANK_DEVICE="cuda"
+uvicorn reranker_service:app --host 127.0.0.1 --port 8001
+```
+
+---
+
+# Minimal process flow
+
+1. start `reranker_service.py`
+2. it loads the model once
+3. your old pipeline runs
+4. old pipeline reads hybrid results
+5. old pipeline sends query + candidates to `/rerank`
+6. service returns ranked results
+7. old pipeline writes `reranked_results.json`
+
+---
+
+# A simpler alternative
+
+If you do not want HTTP, you can also create:
+
+* one Python process running an input loop
+* communicate via `stdin/stdout` JSON
+
+But HTTP/FastAPI is much easier to debug and maintain.
+
+---
+
+# Small production improvements
+
+You may also want to add:
+
+* `/health` check before sending requests
+* retry if service is temporarily unavailable
+* request IDs in logs
+* optional batching across multiple requests
+* authentication if the service runs remotely
+
+---
+
+I can also rewrite your code into two ready-to-drop files matching your exact project structure and imports.
