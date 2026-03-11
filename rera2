@@ -1,0 +1,349 @@
+Below is a clean, simplified, production-ready reranker service using FlagEmbedding with BAAI/bge-reranker-v2-m3.
+
+It is adapted to your setup:
+
+chunks ≈ 450 tokens
+
+no query expansion
+
+no windows
+
+one score per chunk
+
+single model loaded
+
+microservice architecture
+
+
+This is the simplest and safest architecture for your RAG pipeline.
+
+
+---
+
+1️⃣ Install dependencies
+
+pip install fastapi uvicorn FlagEmbedding torch
+
+
+---
+
+2️⃣ reranker_service.py
+
+Copy this complete file.
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Iterable, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
+
+from FlagEmbedding import FlagReranker
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ---------------- CONFIG ----------------
+
+MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+DEVICE = os.getenv("RERANK_DEVICE", "cuda")
+
+MAX_CANDIDATES = 50
+MAX_TEXT_CHARS = 20000
+MAX_TOP_K = 20
+
+# ----------------------------------------
+
+app = FastAPI(title="BGE Reranker Service")
+
+reranker: Optional[FlagReranker] = None
+
+PREDICT_LOCK = threading.Lock()
+
+
+# ---------------- UTILS ----------------
+
+
+def clean_text(text: str) -> str:
+
+    text = text.replace("-\n", "")
+    text = text.replace("\r", "\n")
+
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = "\n\n".join(p for p in text.split("\n\n") if p.strip())
+
+    return text
+
+
+def norm(values: Iterable[float]) -> List[float]:
+
+    vals = [float(v) for v in values]
+
+    if not vals:
+        return vals
+
+    mn = min(vals)
+    mx = max(vals)
+
+    rng = mx - mn
+
+    return [(v - mn) / (rng + 1e-9) for v in vals]
+
+
+# ---------------- API MODELS ----------------
+
+
+class CandidateIn(BaseModel):
+
+    chunkpath: str = ""
+    chunk_name: str = ""
+
+    text: str = Field(min_length=1)
+
+    rrf_score: float = 0.0
+
+    file_txt: str = ""
+    file_path_html: str = ""
+
+    @field_validator("text")
+    def limit_text(cls, v):
+
+        v = v.strip()
+
+        if len(v) > MAX_TEXT_CHARS:
+            v = v[:MAX_TEXT_CHARS]
+
+        return v
+
+
+class RerankRequest(BaseModel):
+
+    query: str = Field(min_length=1)
+
+    candidates: List[CandidateIn]
+
+    alpha: float = Field(default=0.65, ge=0, le=1)
+
+    top_k: int = Field(default=10, ge=1, le=MAX_TOP_K)
+
+
+class RankedResult(BaseModel):
+
+    chunkpath: str
+    chunk_name: str
+
+    file_txt: str
+    file_path_html: str
+
+    ce_score: float
+    blended_score: float
+    rrf_score: float
+
+
+class RerankResponse(BaseModel):
+
+    query: str
+    model: str
+    alpha: float
+
+    results: List[RankedResult]
+
+
+# ---------------- STARTUP ----------------
+
+
+@app.on_event("startup")
+def load_model():
+
+    global reranker
+
+    reranker = FlagReranker(
+        MODEL_NAME,
+        use_fp16=True,
+        device=DEVICE,
+    )
+
+    print(f"[reranker] loaded {MODEL_NAME} on {DEVICE}")
+
+
+# ---------------- HEALTH ----------------
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok" if reranker else "not_ready",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+# ---------------- MAIN RERANK ----------------
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(req: RerankRequest):
+
+    global reranker
+
+    if reranker is None:
+        raise HTTPException(500, "Model not loaded")
+
+    if len(req.candidates) > MAX_CANDIDATES:
+        raise HTTPException(400, "Too many candidates")
+
+    # build query-document pairs
+
+    pairs = [
+        [req.query, clean_text(c.text)]
+        for c in req.candidates
+    ]
+
+    # run reranker
+
+    with PREDICT_LOCK:
+        scores = reranker.compute_score(pairs)
+
+    ce_scores = [float(s) for s in scores]
+
+    retriever_scores = [c.rrf_score for c in req.candidates]
+
+    ce_n = norm(ce_scores)
+    ret_n = norm(retriever_scores)
+
+    blended = [
+        req.alpha * c + (1 - req.alpha) * r
+        for c, r in zip(ce_n, ret_n)
+    ]
+
+    order = sorted(range(len(blended)), key=lambda i: blended[i], reverse=True)
+
+    ranked = []
+
+    for i in order[: req.top_k]:
+
+        cand = req.candidates[i]
+
+        ranked.append(
+            RankedResult(
+                chunkpath=cand.chunkpath,
+                chunk_name=cand.chunk_name,
+                file_txt=cand.file_txt,
+                file_path_html=cand.file_path_html,
+                ce_score=ce_scores[i],
+                blended_score=blended[i],
+                rrf_score=cand.rrf_score,
+            )
+        )
+
+    return RerankResponse(
+        query=req.query,
+        model=MODEL_NAME,
+        alpha=req.alpha,
+        results=ranked,
+    )
+
+
+---
+
+3️⃣ Start the service
+
+uvicorn reranker_service:app --host 0.0.0.0 --port 8020 --workers 1
+
+⚠️ Workers must stay 1 so the model loads only once.
+
+
+---
+
+4️⃣ Client code for your pipeline
+
+reranker_client.py
+
+import requests
+
+
+class RerankerClient:
+
+    def __init__(self, url="http://127.0.0.1:8020"):
+        self.url = url.rstrip("/")
+
+    def rerank(self, query, candidates, top_k=10):
+
+        payload = {
+            "query": query,
+            "candidates": candidates,
+            "top_k": top_k,
+        }
+
+        r = requests.post(
+            f"{self.url}/rerank",
+            json=payload,
+            timeout=300,
+        )
+
+        r.raise_for_status()
+
+        return r.json()
+
+
+---
+
+5️⃣ Example usage
+
+client = RerankerClient()
+
+result = client.rerank(
+    query="How to plot cross section line",
+    candidates=[
+        {
+            "text": "This function plots cross section profiles.",
+            "rrf_score": 0.8,
+            "chunkpath": "file1.txt"
+        },
+        {
+            "text": "Road stationing explanation.",
+            "rrf_score": 0.5,
+            "chunkpath": "file2.txt"
+        }
+    ],
+)
+
+print(result)
+
+
+---
+
+6️⃣ Your final RAG architecture
+
+Retriever
+   ↓
+Top 100 chunks
+   ↓
+Select top 30
+   ↓
+Reranker service
+   ↓
+Top 10 chunks
+   ↓
+LLM generation
+
+
+---
+
+✅ This version is:
+
+simpler
+
+faster
+
+correct for 450-token chunks
+
+easy to maintain
+
+
+
+---
+
+If you want, I can also show one architectural improvement that can make this service handle ~10× more requests per second without loading another model.
