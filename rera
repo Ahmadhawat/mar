@@ -1,0 +1,440 @@
+Below is a complete reranker microservice using FlagReranker.
+It follows the architecture you wanted:
+
+model loads once
+
+other processes call it via API
+
+safe batching
+
+memory protection
+
+input validation
+
+top_k applied correctly
+
+production-safe structure
+
+
+The model used is BAAI/bge-reranker-v2-m3 and the library is FlagEmbedding.
+
+
+---
+
+1️⃣ Install dependencies
+
+pip install fastapi uvicorn FlagEmbedding torch
+
+
+---
+
+2️⃣ reranker_service.py
+
+Copy this file.
+
+from __future__ import annotations
+
+import os
+import re
+import threading
+from typing import Dict, Iterable, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, field_validator
+
+from FlagEmbedding import FlagReranker
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ---------------- CONFIG ----------------
+
+MODEL_NAME = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+DEVICE = os.getenv("RERANK_DEVICE", "cuda")
+
+MAX_CANDIDATES = 50
+MAX_TEXT_CHARS = 20000
+MAX_TOP_K = 20
+MAX_PAIRS = 4000
+
+# ----------------------------------------
+
+app = FastAPI(title="BGE Reranker Service")
+
+reranker: Optional[FlagReranker] = None
+
+PREDICT_LOCK = threading.Lock()
+
+# ---------------- TEXT HELPERS ----------------
+
+
+def clean_text(text: str) -> str:
+
+    text = text.replace("-\n", "")
+    text = text.replace("\r", "\n")
+
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = "\n\n".join(p for p in text.split("\n\n") if p.strip())
+
+    return text
+
+
+def make_windows(
+    text: str,
+    approx_tokens: int,
+    max_windows: Optional[int],
+) -> List[str]:
+
+    sents = re.split(r"(?<=[.!?:;])\s+", text)
+
+    blocks: List[str] = []
+    cur: List[str] = []
+    wc = 0
+
+    for s in sents:
+
+        if not s.strip():
+            continue
+
+        cur.append(s)
+        wc += len(s.split())
+
+        if wc >= approx_tokens:
+
+            blocks.append(" ".join(cur))
+
+            cur = cur[-1:]
+            wc = len(cur[-1].split())
+
+            if max_windows and len(blocks) >= max_windows:
+                break
+
+    if cur and (max_windows is None or len(blocks) < max_windows):
+        blocks.append(" ".join(cur))
+
+    return blocks or [text]
+
+
+def de_query_variants(query: str) -> List[str]:
+
+    variants = [query]
+
+    ql = query.lower()
+
+    extra: List[str] = []
+
+    if "querprofil" in ql:
+        extra += [
+            "Querprofillinie",
+            "Querprofillinien",
+            "Querschnittsprofil",
+        ]
+
+    if "station" in ql or "achsstation" in ql:
+        extra += ["Achsstation", "Stationierung", "Stationen"]
+
+    if "plot" in ql:
+        extra += ["zeichnen", "darstellen", "plotten"]
+
+    if extra:
+        variants.append(query + " (" + ", ".join(extra[:6]) + ")")
+
+    return variants
+
+
+def norm(values: Iterable[float]) -> List[float]:
+
+    vals = [float(v) for v in values]
+
+    if not vals:
+        return vals
+
+    mn = min(vals)
+    mx = max(vals)
+
+    rng = mx - mn
+
+    return [(v - mn) / (rng + 1e-9) for v in vals]
+
+
+# ---------------- API MODELS ----------------
+
+
+class CandidateIn(BaseModel):
+
+    chunkpath: str = ""
+    chunk_name: str = ""
+
+    text: str = Field(min_length=1)
+
+    rrf_score: float = 0.0
+
+    file_txt: str = ""
+    file_path_html: str = ""
+
+    @field_validator("text")
+    def limit_text(cls, v):
+
+        v = v.strip()
+
+        if len(v) > MAX_TEXT_CHARS:
+            v = v[:MAX_TEXT_CHARS]
+
+        return v
+
+
+class RerankRequest(BaseModel):
+
+    query: str = Field(min_length=1)
+
+    candidates: List[CandidateIn]
+
+    alpha: float = Field(default=0.65, ge=0, le=1)
+
+    window_tokens: int = Field(default=180, ge=20, le=512)
+
+    max_windows_per_doc: Optional[int] = Field(default=6, ge=1, le=20)
+
+    top_k: int = Field(default=10, ge=1, le=MAX_TOP_K)
+
+
+class RankedResult(BaseModel):
+
+    chunkpath: str
+    chunk_name: str
+
+    file_txt: str
+    file_path_html: str
+
+    ce_score: float
+    blended_score: float
+    rrf_score: float
+
+
+class RerankResponse(BaseModel):
+
+    query: str
+    model: str
+    alpha: float
+
+    results: List[RankedResult]
+
+
+# ---------------- STARTUP ----------------
+
+
+@app.on_event("startup")
+def load_model():
+
+    global reranker
+
+    reranker = FlagReranker(
+        MODEL_NAME,
+        use_fp16=True,
+        device=DEVICE,
+    )
+
+    print(f"[reranker] loaded {MODEL_NAME} on {DEVICE}")
+
+
+# ---------------- HEALTH ----------------
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok" if reranker else "not_ready",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+# ---------------- MAIN RERANK ----------------
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(req: RerankRequest):
+
+    global reranker
+
+    if reranker is None:
+        raise HTTPException(500, "Model not loaded")
+
+    if len(req.candidates) > MAX_CANDIDATES:
+        raise HTTPException(400, "Too many candidates")
+
+    qvars = de_query_variants(req.query)
+
+    pairs: List[List[str]] = []
+    doc_index: List[int] = []
+
+    for i, cand in enumerate(req.candidates):
+
+        windows = make_windows(
+            clean_text(cand.text),
+            approx_tokens=req.window_tokens,
+            max_windows=req.max_windows_per_doc,
+        )
+
+        for qv in qvars:
+            for w in windows:
+
+                pairs.append([qv, w])
+                doc_index.append(i)
+
+    if len(pairs) > MAX_PAIRS:
+
+        pairs = pairs[:MAX_PAIRS]
+        doc_index = doc_index[:MAX_PAIRS]
+
+    ce_scores = [-1e9] * len(req.candidates)
+
+    with PREDICT_LOCK:
+
+        scores = reranker.compute_score(pairs)
+
+    for score, idx in zip(scores, doc_index):
+
+        ce_scores[idx] = max(ce_scores[idx], float(score))
+
+    retriever_scores = [c.rrf_score for c in req.candidates]
+
+    ce_n = norm(ce_scores)
+    ret_n = norm(retriever_scores)
+
+    blended = [
+        req.alpha * c + (1 - req.alpha) * r
+        for c, r in zip(ce_n, ret_n)
+    ]
+
+    order = sorted(range(len(blended)), key=lambda i: blended[i], reverse=True)
+
+    ranked = []
+
+    for i in order[: req.top_k]:
+
+        cand = req.candidates[i]
+
+        ranked.append(
+            RankedResult(
+                chunkpath=cand.chunkpath,
+                chunk_name=cand.chunk_name,
+                file_txt=cand.file_txt,
+                file_path_html=cand.file_path_html,
+                ce_score=ce_scores[i],
+                blended_score=blended[i],
+                rrf_score=cand.rrf_score,
+            )
+        )
+
+    return RerankResponse(
+        query=req.query,
+        model=MODEL_NAME,
+        alpha=req.alpha,
+        results=ranked,
+    )
+
+
+---
+
+3️⃣ Start the service
+
+Run:
+
+uvicorn reranker_service:app --host 0.0.0.0 --port 8020 --workers 1
+
+⚠️ Workers must stay 1 to avoid loading the model multiple times.
+
+
+---
+
+4️⃣ Client code for your RAG pipeline
+
+reranker_client.py
+
+import requests
+
+
+class RerankerClient:
+
+    def __init__(self, url="http://127.0.0.1:8020"):
+        self.url = url.rstrip("/")
+
+    def rerank(self, query, candidates, top_k=10):
+
+        payload = {
+            "query": query,
+            "candidates": candidates,
+            "top_k": top_k,
+        }
+
+        r = requests.post(
+            f"{self.url}/rerank",
+            json=payload,
+            timeout=300,
+        )
+
+        r.raise_for_status()
+
+        return r.json()
+
+
+---
+
+5️⃣ Example usage
+
+client = RerankerClient()
+
+result = client.rerank(
+    query="How to plot cross section line",
+    candidates=[
+        {
+            "text": "This function plots cross section profiles.",
+            "rrf_score": 0.8,
+            "chunkpath": "file1.txt"
+        },
+        {
+            "text": "Road stationing explanation.",
+            "rrf_score": 0.5,
+            "chunkpath": "file2.txt"
+        }
+    ],
+)
+
+print(result)
+
+
+---
+
+6️⃣ Recommended pipeline
+
+Retriever
+   ↓
+Top 100 chunks
+   ↓
+Filter to top 30
+   ↓
+Reranker service
+   ↓
+Top 10 chunks
+   ↓
+LLM answer
+
+
+---
+
+✅ This version now uses:
+
+official BGE library
+
+one model instance
+
+safe batching
+
+microservice architecture
+
+
+
+---
+
+If you want, I can also show one very important improvement to this service that can double throughput under heavy load (used by search engines).
