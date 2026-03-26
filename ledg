@@ -1,0 +1,397 @@
+Here is the final version.
+
+It does this:
+
+reads id, Frage, reference from Excel
+
+loads all search configs from a folder
+
+runs the RAG pipeline
+
+checks whether reference is in in_output.rank_html
+
+stores only compact retrieval results in SQLite
+
+resumes automatically because (config_name, question_id) is the primary key
+
+prints useful status lines, especially when the reference is found, including the corrected query
+
+
+Python code
+
+import sqlite3
+from pathlib import Path
+from typing import Dict, Any, List
+
+import pandas as pd
+import yaml
+
+from src.pipeline.config import load_config
+from src.utils.logging import get_logger
+from src.search import run_query, make_pipeline
+from src.search import Outputs
+
+
+# --------------------------------------------------
+# Config
+# --------------------------------------------------
+
+def load_batch_eval_config(path: str = "config/config.ledger.yaml") -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if "batch_eval" not in cfg:
+        raise ValueError("config.ledger.yaml must contain 'batch_eval'")
+
+    return cfg["batch_eval"]
+
+
+# --------------------------------------------------
+# Matching helpers
+# --------------------------------------------------
+
+def normalize_text(s: Any) -> str:
+    if s is None:
+        return ""
+    return str(s).strip().lower().replace("\\", "/")
+
+
+def find_reference_rank(reference: str, retrieved_docs: List[str]) -> int:
+    """
+    Return 1-based rank if reference is found, else 0.
+
+    Matching strategy:
+    1. exact normalized equality
+    2. substring match both directions
+    """
+    ref = normalize_text(reference)
+    if not ref:
+        return 0
+
+    for i, doc in enumerate(retrieved_docs, start=1):
+        d = normalize_text(doc)
+        if not d:
+            continue
+
+        if ref == d:
+            return i
+
+        if ref in d or d in ref:
+            return i
+
+    return 0
+
+
+# --------------------------------------------------
+# SQLite helpers
+# --------------------------------------------------
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS retrieval_eval (
+            config_name TEXT NOT NULL,
+            question_id INTEGER NOT NULL,
+            frage TEXT,
+            reference TEXT,
+            corrected_query TEXT,
+            hit INTEGER NOT NULL,
+            rank_pos INTEGER NOT NULL,
+            PRIMARY KEY (config_name, question_id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_retrieval_eval_config
+        ON retrieval_eval (config_name)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_retrieval_eval_hit
+        ON retrieval_eval (config_name, hit)
+        """
+    )
+
+    conn.commit()
+    return conn
+
+
+def already_done(conn: sqlite3.Connection, config_name: str, question_id: int) -> bool:
+    cur = conn.execute(
+        """
+        SELECT 1
+        FROM retrieval_eval
+        WHERE config_name = ? AND question_id = ?
+        LIMIT 1
+        """,
+        (config_name, question_id),
+    )
+    return cur.fetchone() is not None
+
+
+def insert_result(
+    conn: sqlite3.Connection,
+    *,
+    config_name: str,
+    question_id: int,
+    frage: str,
+    reference: str,
+    corrected_query: str,
+    hit: int,
+    rank_pos: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO retrieval_eval (
+            config_name,
+            question_id,
+            frage,
+            reference,
+            corrected_query,
+            hit,
+            rank_pos
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            config_name,
+            question_id,
+            frage,
+            reference,
+            corrected_query,
+            hit,
+            rank_pos,
+        ),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+
+def main() -> None:
+    be_cfg = load_batch_eval_config()
+
+    input_xlsx = Path(be_cfg["input_xlsx"])
+    search_config_folder = Path(be_cfg["search_config_folder"])
+    sqlite_path = Path(be_cfg.get("sqlite_path", "runs/retrieval_eval.sqlite"))
+
+    id_col = be_cfg.get("id_col", "id")
+    frage_col = be_cfg.get("question_col", "Frage")
+    reference_col = be_cfg.get("reference_col", "reference")
+
+    logs = get_logger("RetrieveEval")
+    conn = init_db(sqlite_path)
+
+    cfg_files = sorted(search_config_folder.glob("*.yaml"))
+    if not cfg_files:
+        raise FileNotFoundError(f"No *.yaml files found in {search_config_folder}")
+
+    df = pd.read_excel(input_xlsx)
+
+    required_cols = [id_col, frage_col, reference_col]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing columns in {input_xlsx}: {missing}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    # keep only rows with non-empty questions
+    mask = df[frage_col].notna() & df[frage_col].astype(str).str.strip().astype(bool)
+    df = df[mask].copy()
+
+    total_questions = len(df)
+    logs.info(f"Loaded {total_questions} questions from {input_xlsx}")
+
+    for cfg_path in cfg_files:
+        config_name = cfg_path.stem
+        logs.info("=" * 80)
+        logs.info(f"Starting config: {config_name}")
+
+        search_cfg = load_config(cfg_path)
+        pipeline = make_pipeline(search_cfg["run"]["steps"])
+
+        processed = 0
+        skipped = 0
+        hits = 0
+        misses = 0
+        errors = 0
+
+        for idx, row in enumerate(df.itertuples(index=False), start=1):
+            question_id = int(getattr(row, id_col))
+            frage = str(getattr(row, frage_col))
+            reference = "" if pd.isna(getattr(row, reference_col)) else str(getattr(row, reference_col))
+
+            if already_done(conn, config_name, question_id):
+                skipped += 1
+                continue
+
+            logs.info(f"[{config_name}] [{idx}/{total_questions}] id={question_id}")
+
+            try:
+                in_output: Outputs = run_query(frage, pipeline, search_cfg, logs)
+
+                retrieved_docs = in_output.rank_html or []
+                corrected_query = getattr(in_output, "corrected_query", "") or ""
+
+                rank_pos = find_reference_rank(reference, retrieved_docs)
+                hit = 1 if rank_pos > 0 else 0
+
+                insert_result(
+                    conn=conn,
+                    config_name=config_name,
+                    question_id=question_id,
+                    frage=frage,
+                    reference=reference,
+                    corrected_query=corrected_query,
+                    hit=hit,
+                    rank_pos=rank_pos,
+                )
+
+                processed += 1
+
+                if hit == 1:
+                    hits += 1
+                    print(
+                        f"[HIT] config={config_name} id={question_id} "
+                        f"rank={rank_pos} "
+                        f"reference='{reference}' "
+                        f"corrected_query='{corrected_query}'"
+                    )
+                else:
+                    misses += 1
+                    print(
+                        f"[MISS] config={config_name} id={question_id} "
+                        f"reference='{reference}' "
+                        f"corrected_query='{corrected_query}'"
+                    )
+
+            except Exception as e:
+                errors += 1
+                logs.exception(f"Error for config={config_name}, id={question_id}: {e}")
+
+        total_done_now = processed
+        hit_rate = (hits / total_done_now * 100.0) if total_done_now > 0 else 0.0
+
+        logs.info(
+            f"Finished config={config_name} | "
+            f"processed={processed} skipped={skipped} hits={hits} misses={misses} errors={errors} "
+            f"hit_rate={hit_rate:.2f}%"
+        )
+
+    conn.close()
+    logs.info(f"Done. Results stored in {sqlite_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+Final config
+
+Save this as config/config.ledger.yaml.
+
+batch_eval:
+  input_xlsx: "./ledger/kurz.xlsx"
+
+  id_col: "id"
+  question_col: "Frage"
+  reference_col: "reference"
+
+  search_config_folder: "ledger/configs_search"
+  sqlite_path: "./runs/retrieval_eval.sqlite"
+
+What gets stored in SQLite
+
+Table: retrieval_eval
+
+Columns:
+
+config_name
+
+question_id
+
+frage
+
+reference
+
+corrected_query
+
+hit
+
+rank_pos
+
+
+That is compact and enough for retrieval evaluation.
+
+Status output example
+
+When reference is found:
+
+[HIT] config=config.search id=144 rank=2 reference='doc_abc.pdf' corrected_query='vertrag laufzeit kündigung'
+
+When not found:
+
+[MISS] config=config.search id=145 reference='doc_xyz.pdf' corrected_query='rechnung zahlungsziel'
+
+Resume behavior
+
+It resumes automatically.
+
+Because of this primary key:
+
+(config_name, question_id)
+
+
+and this check:
+
+if already_done(conn, config_name, question_id):
+    skipped += 1
+    continue
+
+So if the run stops at question 2317, start it again and it will continue with the remaining rows.
+
+Useful SQL queries
+
+Hit rate per config:
+
+SELECT
+    config_name,
+    COUNT(*) AS total,
+    SUM(hit) AS hits,
+    ROUND(100.0 * SUM(hit) / COUNT(*), 2) AS hit_rate_percent
+FROM retrieval_eval
+GROUP BY config_name
+ORDER BY config_name;
+
+Top-1 / Top-3 / Top-5:
+
+SELECT
+    config_name,
+    COUNT(*) AS total,
+    SUM(CASE WHEN rank_pos = 1 THEN 1 ELSE 0 END) AS top1,
+    SUM(CASE WHEN rank_pos BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS top3,
+    SUM(CASE WHEN rank_pos BETWEEN 1 AND 5 THEN 1 ELSE 0 END) AS top5
+FROM retrieval_eval
+GROUP BY config_name
+ORDER BY config_name;
+
+Rows where reference was found:
+
+SELECT question_id, frage, reference, corrected_query, rank_pos
+FROM retrieval_eval
+WHERE hit = 1
+ORDER BY config_name, question_id;
+
+If you want, I can also give you a second small script that reads the SQLite file and prints the final evaluation summary nicely.
