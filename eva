@@ -1,0 +1,241 @@
+import argparse
+import sqlite3
+from pathlib import PurePosixPath
+from typing import List, Optional, Tuple
+
+
+def normalize_text(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().replace("\\", "/").lower()
+
+
+def split_raw_files(raw_files: Optional[str]) -> List[str]:
+    if not raw_files:
+        return []
+    return [part.strip() for part in str(raw_files).split(",") if part.strip()]
+
+
+def extract_filename(path_str: str) -> str:
+    s = normalize_text(path_str)
+    if not s:
+        return ""
+    return PurePosixPath(s).name
+
+
+def extract_from_content(path_str: str) -> str:
+    """
+    Return the normalized suffix starting at 'content/' if present.
+
+    Example:
+        'x/y/content/a/b/file.htm' -> 'content/a/b/file.htm'
+    """
+    s = normalize_text(path_str)
+    marker = "content/"
+    idx = s.find(marker)
+    if idx == -1:
+        return ""
+    return s[idx:]
+
+
+def match_reference(reference: str, raw_files_list: List[str]) -> Tuple[bool, str, str]:
+    """
+    Returns:
+        matched: bool
+        match_mode: 'content' or 'filename' or 'none'
+        normalized_reference_key: the key used for matching
+    """
+    ref_content = extract_from_content(reference)
+
+    if ref_content:
+        raw_content_paths = [extract_from_content(x) for x in raw_files_list]
+        if ref_content in raw_content_paths:
+            return True, "content", ref_content
+
+    ref_file = extract_filename(reference)
+    if ref_file:
+        raw_file_names = [extract_filename(x) for x in raw_files_list]
+        if ref_file in raw_file_names:
+            return True, "filename", ref_file
+
+    if ref_content:
+        return False, "content", ref_content
+    if ref_file:
+        return False, "filename", ref_file
+    return False, "none", ""
+
+
+def fetch_rows(conn: sqlite3.Connection, config_name: Optional[str] = None) -> List[sqlite3.Row]:
+    if config_name:
+        query = """
+            SELECT
+                t.id AS task_id,
+                t.source_id,
+                t.reference,
+                t.question,
+                t.raw_files,
+                t.status,
+                cr.config_name
+            FROM tasks t
+            JOIN config_runs cr ON t.config_run_id = cr.id
+            WHERE t.status = 'done'
+              AND cr.config_name = ?
+            ORDER BY t.source_id ASC, t.id ASC
+        """
+        return conn.execute(query, (config_name,)).fetchall()
+
+    query = """
+        SELECT
+            t.id AS task_id,
+            t.source_id,
+            t.reference,
+            t.question,
+            t.raw_files,
+            t.status,
+            cr.config_name
+        FROM tasks t
+        JOIN config_runs cr ON t.config_run_id = cr.id
+        WHERE t.status = 'done'
+        ORDER BY cr.config_name ASC, t.source_id ASC, t.id ASC
+    """
+    return conn.execute(query).fetchall()
+
+
+def evaluate_retriever(
+    db_path: str,
+    config_name: Optional[str] = None,
+    show_misses: int = 10,
+) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        rows = fetch_rows(conn, config_name=config_name)
+
+        total = 0
+        hits = 0
+        misses = 0
+        skipped = 0
+
+        content_matches = 0
+        filename_fallback_matches = 0
+
+        miss_examples = []
+
+        for row in rows:
+            reference = row["reference"]
+            raw_files = row["raw_files"]
+            question = row["question"]
+            source_id = row["source_id"]
+            cfg_name = row["config_name"]
+
+            if not reference or not raw_files:
+                skipped += 1
+                continue
+
+            raw_files_list = split_raw_files(raw_files)
+            if not raw_files_list:
+                skipped += 1
+                continue
+
+            total += 1
+
+            matched, match_mode, ref_key = match_reference(reference, raw_files_list)
+
+            if matched:
+                hits += 1
+                if match_mode == "content":
+                    content_matches += 1
+                elif match_mode == "filename":
+                    filename_fallback_matches += 1
+            else:
+                misses += 1
+                if len(miss_examples) < show_misses:
+                    miss_examples.append(
+                        {
+                            "config_name": cfg_name,
+                            "source_id": source_id,
+                            "question": question,
+                            "reference": reference,
+                            "reference_content_key": extract_from_content(reference),
+                            "reference_filename": extract_filename(reference),
+                            "raw_files": raw_files_list,
+                            "raw_content_keys": [extract_from_content(x) for x in raw_files_list],
+                            "raw_filenames": [extract_filename(x) for x in raw_files_list],
+                        }
+                    )
+
+        hit_rate = (hits / total) if total > 0 else 0.0
+
+        print("Retriever Evaluation")
+        print("====================")
+        print(f"DB: {db_path}")
+        if config_name:
+            print(f"Config filter: {config_name}")
+        print()
+        print(f"Evaluated rows : {total}")
+        print(f"Hits           : {hits}")
+        print(f"Misses         : {misses}")
+        print(f"Skipped        : {skipped}")
+        print(f"Hit@10         : {hit_rate:.4f} ({hit_rate * 100:.2f}%)")
+        print()
+        print(f"Matched by content path : {content_matches}")
+        print(f"Matched by filename     : {filename_fallback_matches}")
+
+        if miss_examples:
+            print()
+            print("Sample misses")
+            print("-------------")
+            for i, item in enumerate(miss_examples, start=1):
+                print(f"[{i}] config={item['config_name']} | source_id={item['source_id']}")
+                print(f"Question: {item['question']}")
+                print(f"Reference: {item['reference']}")
+                print(f"Reference content key: {item['reference_content_key']}")
+                print(f"Reference filename: {item['reference_filename']}")
+                print("Retrieved files:")
+                for j, rf in enumerate(item["raw_files"], start=1):
+                    print(f"  {j:02d}. {rf}")
+                print("Retrieved content keys:")
+                for j, rk in enumerate(item["raw_content_keys"], start=1):
+                    print(f"  {j:02d}. {rk}")
+                print("Retrieved filenames:")
+                for j, fn in enumerate(item["raw_filenames"], start=1):
+                    print(f"  {j:02d}. {fn}")
+                print("-" * 80)
+
+    finally:
+        conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate retriever from results.sqlite using reference vs raw_files"
+    )
+    parser.add_argument(
+        "--db",
+        required=True,
+        help="Path to results.sqlite",
+    )
+    parser.add_argument(
+        "--config-name",
+        default=None,
+        help="Optional config name filter",
+    )
+    parser.add_argument(
+        "--show-misses",
+        type=int,
+        default=10,
+        help="Number of miss examples to print",
+    )
+
+    args = parser.parse_args()
+
+    evaluate_retriever(
+        db_path=args.db,
+        config_name=args.config_name,
+        show_misses=args.show_misses,
+    )
+
+
+if __name__ == "__main__":
+    main()
