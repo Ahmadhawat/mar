@@ -1,0 +1,702 @@
+import argparse
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import yaml
+
+from src.pipeline.config import load_config
+from src.search import Outputs, make_pipeline, run_query
+from src.utils.logging import get_logger
+
+
+# --------------------------------------------------
+# Time helpers
+# --------------------------------------------------
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# --------------------------------------------------
+# Load batch evaluation config
+# --------------------------------------------------
+
+def load_batch_eval_config(path: str = "config/config.ledger.yaml") -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if "batch_eval" not in cfg:
+        raise ValueError("config.ledger.yaml must contain 'batch_eval'")
+    return cfg["batch_eval"]
+
+
+# --------------------------------------------------
+# Folder helpers
+# --------------------------------------------------
+
+def create_run_folder(base_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = base_dir / f"run_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def create_config_folder(base_dir: Path, name: str) -> Path:
+    conf_dir = base_dir / name
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    return conf_dir
+
+
+# --------------------------------------------------
+# Config snapshot helpers
+# --------------------------------------------------
+
+def extract_from_path(root: Dict[str, Any], path: str):
+    parts = path.split(".")
+    cur = root
+    for p in parts:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return None
+    return cur
+
+
+def insert_into_path(root: Dict[str, Any], path: str, value: Any):
+    parts = path.split(".")
+    cur = root
+    for p in parts[:-1]:
+        cur = cur.setdefault(p, {})
+    cur[parts[-1]] = value
+
+
+def build_config_snapshot(search_cfg: Dict[str, Any], paths_to_take: List[str]) -> Dict[str, Any]:
+    snapshot = {}
+    for path in paths_to_take:
+        value = extract_from_path(search_cfg, path)
+        if value is not None:
+            insert_into_path(snapshot, path, value)
+    return snapshot
+
+
+# --------------------------------------------------
+# SQLite helpers
+# --------------------------------------------------
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_name TEXT NOT NULL,
+            run_dir TEXT NOT NULL UNIQUE,
+            input_xlsx TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS config_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            config_name TEXT NOT NULL,
+            config_path TEXT NOT NULL,
+            config_snapshot_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+            UNIQUE(run_id, config_name)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_run_id INTEGER NOT NULL,
+            source_id INTEGER NOT NULL,
+            reference TEXT,
+            question TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            answer TEXT,
+            raw_files TEXT,
+            corrected_query TEXT,
+            error_message TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (config_run_id) REFERENCES config_runs(id) ON DELETE CASCADE,
+            UNIQUE(config_run_id, source_id)
+        )
+        """
+    )
+
+    conn.commit()
+    return conn
+
+
+# --------------------------------------------------
+# DB CRUD helpers
+# --------------------------------------------------
+
+def create_run_record(conn: sqlite3.Connection, run_dir: Path, input_xlsx: Path) -> int:
+    ts = now_iso()
+    run_name = run_dir.name
+    cur = conn.execute(
+        """
+        INSERT INTO runs (run_name, run_dir, input_xlsx, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (run_name, str(run_dir), str(input_xlsx), "created", ts, ts),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_run_by_dir(conn: sqlite3.Connection, run_dir: Path) -> Optional[sqlite3.Row]:
+    cur = conn.execute(
+        "SELECT * FROM runs WHERE run_dir = ?",
+        (str(run_dir),),
+    )
+    return cur.fetchone()
+
+
+def update_run_status(conn: sqlite3.Connection, run_id: int, status: str) -> None:
+    conn.execute(
+        """
+        UPDATE runs
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (status, now_iso(), run_id),
+    )
+    conn.commit()
+
+
+def create_or_get_config_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    config_name: str,
+    config_path: Path,
+    config_snapshot_path: Path,
+) -> int:
+    ts = now_iso()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO config_runs (
+            run_id, config_name, config_path, config_snapshot_path, status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            config_name,
+            str(config_path),
+            str(config_snapshot_path),
+            "created",
+            ts,
+            ts,
+        ),
+    )
+    conn.commit()
+
+    cur = conn.execute(
+        """
+        SELECT id
+        FROM config_runs
+        WHERE run_id = ? AND config_name = ?
+        """,
+        (run_id, config_name),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"Could not create or retrieve config_run for {config_name}")
+    return int(row["id"])
+
+
+def get_config_runs_for_run(conn: sqlite3.Connection, run_id: int) -> List[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT *
+        FROM config_runs
+        WHERE run_id = ?
+        ORDER BY config_name
+        """,
+        (run_id,),
+    )
+    return cur.fetchall()
+
+
+def update_config_run_status(conn: sqlite3.Connection, config_run_id: int, status: str) -> None:
+    conn.execute(
+        """
+        UPDATE config_runs
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (status, now_iso(), config_run_id),
+    )
+    conn.commit()
+
+
+def register_tasks(
+    conn: sqlite3.Connection,
+    config_run_id: int,
+    df: pd.DataFrame,
+    id_col: str,
+    reference_col: str,
+    question_col: str,
+) -> int:
+    ts = now_iso()
+    inserted_or_existing = 0
+
+    for _, row in df.iterrows():
+        source_id = row[id_col]
+        reference = row[reference_col]
+        question = row[question_col]
+
+        if pd.isna(question):
+            continue
+
+        question = str(question).strip()
+        if not question:
+            continue
+
+        reference = "" if pd.isna(reference) else str(reference).strip()
+
+        if pd.isna(source_id):
+            raise ValueError("Encountered empty source_id in Excel; id column must be present for all rows.")
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO tasks (
+                config_run_id,
+                source_id,
+                reference,
+                question,
+                status,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                config_run_id,
+                int(source_id),
+                reference,
+                question,
+                ts,
+            ),
+        )
+        inserted_or_existing += 1
+
+    conn.commit()
+    return inserted_or_existing
+
+
+def reset_running_tasks_to_pending(conn: sqlite3.Connection) -> int:
+    cur = conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'pending',
+            updated_at = ?
+        WHERE status = 'running'
+        """,
+        (now_iso(),),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def fetch_next_task(
+    conn: sqlite3.Connection,
+    config_run_id: int,
+    max_retries: int,
+) -> Optional[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT *
+        FROM tasks
+        WHERE config_run_id = ?
+          AND (
+                status = 'pending'
+                OR (status = 'error' AND attempt_count < ?)
+              )
+        ORDER BY source_id ASC, id ASC
+        LIMIT 1
+        """,
+        (config_run_id, max_retries),
+    )
+    return cur.fetchone()
+
+
+def mark_task_running(conn: sqlite3.Connection, task_id: int) -> None:
+    ts = now_iso()
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'running',
+            started_at = COALESCE(started_at, ?),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (ts, ts, task_id),
+    )
+    conn.commit()
+
+
+def mark_task_done(
+    conn: sqlite3.Connection,
+    task_id: int,
+    answer: Optional[str],
+    raw_files: str,
+    corrected_query: str,
+) -> None:
+    ts = now_iso()
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'done',
+            answer = ?,
+            raw_files = ?,
+            corrected_query = ?,
+            error_message = NULL,
+            finished_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (answer, raw_files, corrected_query, ts, ts, task_id),
+    )
+    conn.commit()
+
+
+def mark_task_error(conn: sqlite3.Connection, task_id: int, error_message: str) -> None:
+    ts = now_iso()
+    conn.execute(
+        """
+        UPDATE tasks
+        SET status = 'error',
+            attempt_count = attempt_count + 1,
+            error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (error_message[:4000], ts, task_id),
+    )
+    conn.commit()
+
+
+def get_task_counts_for_config(conn: sqlite3.Connection, config_run_id: int) -> Dict[str, int]:
+    cur = conn.execute(
+        """
+        SELECT status, COUNT(*) AS cnt
+        FROM tasks
+        WHERE config_run_id = ?
+        GROUP BY status
+        """,
+        (config_run_id,),
+    )
+    counts = {"pending": 0, "running": 0, "done": 0, "error": 0}
+    for row in cur.fetchall():
+        counts[row["status"]] = int(row["cnt"])
+    return counts
+
+
+def get_retryable_error_count_for_config(conn: sqlite3.Connection, config_run_id: int, max_retries: int) -> int:
+    cur = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM tasks
+        WHERE config_run_id = ?
+          AND status = 'error'
+          AND attempt_count < ?
+        """,
+        (config_run_id, max_retries),
+    )
+    row = cur.fetchone()
+    return int(row["cnt"] if row else 0)
+
+
+def get_non_retryable_error_count_for_config(conn: sqlite3.Connection, config_run_id: int, max_retries: int) -> int:
+    cur = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM tasks
+        WHERE config_run_id = ?
+          AND status = 'error'
+          AND attempt_count >= ?
+        """,
+        (config_run_id, max_retries),
+    )
+    row = cur.fetchone()
+    return int(row["cnt"] if row else 0)
+
+
+def refresh_config_run_final_status(conn: sqlite3.Connection, config_run_id: int, max_retries: int) -> str:
+    counts = get_task_counts_for_config(conn, config_run_id)
+    permanent_errors = get_non_retryable_error_count_for_config(conn, config_run_id, max_retries)
+
+    if counts["pending"] == 0 and counts["running"] == 0 and counts["error"] == 0:
+        status = "completed"
+    elif counts["pending"] == 0 and counts["running"] == 0 and permanent_errors > 0:
+        status = "completed_with_errors"
+    else:
+        status = "running"
+
+    update_config_run_status(conn, config_run_id, status)
+    return status
+
+
+def refresh_run_final_status(conn: sqlite3.Connection, run_id: int) -> str:
+    cur = conn.execute(
+        """
+        SELECT status, COUNT(*) AS cnt
+        FROM config_runs
+        WHERE run_id = ?
+        GROUP BY status
+        """,
+        (run_id,),
+    )
+
+    summary = {}
+    for row in cur.fetchall():
+        summary[row["status"]] = int(row["cnt"])
+
+    if not summary:
+        status = "failed"
+    elif set(summary.keys()) == {"completed"}:
+        status = "completed"
+    elif "running" in summary or "created" in summary:
+        status = "running"
+    elif "completed_with_errors" in summary:
+        status = "completed_with_errors"
+    elif "failed" in summary:
+        status = "failed"
+    else:
+        status = "completed_with_errors"
+
+    update_run_status(conn, run_id, status)
+    return status
+
+
+# --------------------------------------------------
+# Excel helpers
+# --------------------------------------------------
+
+def load_input_dataframe(input_xlsx: Path, id_col: str, reference_col: str, question_col: str) -> pd.DataFrame:
+    if not input_xlsx.exists():
+        raise FileNotFoundError(f"Input file not found: {input_xlsx}")
+
+    df = pd.read_excel(input_xlsx)
+
+    required_cols = [id_col, reference_col, question_col]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns in {input_xlsx}: {missing_cols}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    mask = df[question_col].notna() & df[question_col].astype(str).str.strip().astype(bool)
+    df = df[mask].copy()
+
+    if df.empty:
+        raise ValueError("No valid question rows found in Excel.")
+
+    return df
+
+
+# --------------------------------------------------
+# Run preparation
+# --------------------------------------------------
+
+def save_config_snapshot(cfg_snapshot_path: Path, snapshot: Dict[str, Any]) -> None:
+    cfg_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    with cfg_snapshot_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(snapshot, f, sort_keys=False, allow_unicode=True)
+
+
+def create_new_run(
+    conn: sqlite3.Connection,
+    be_cfg: Dict[str, Any],
+    run_dir: Path,
+    df: pd.DataFrame,
+    logs,
+) -> int:
+    input_xlsx = Path(be_cfg["input_xlsx"])
+    id_col = be_cfg.get("id_col", "id")
+    reference_col = be_cfg.get("reference_col", "reference")
+    question_col = be_cfg.get("question_col", "frage")
+    snapshot_paths = be_cfg.get("snapshot_paths", [])
+    search_cfg_folder = Path(be_cfg["search_config_folder"])
+    cfg_files = sorted(search_cfg_folder.glob("*.yaml"))
+    cfg_snapshot_name = be_cfg["filenames"]["config_snapshot"]
+
+    if not cfg_files:
+        raise FileNotFoundError(
+            f"No *.yaml files found in {search_cfg_folder}. "
+            "Please provide at least one configuration file."
+        )
+
+    run_id = create_run_record(conn, run_dir, input_xlsx)
+    update_run_status(conn, run_id, "running")
+
+    logs.info(f"Created new run: {run_dir}")
+
+    for cfg_path in cfg_files:
+        cfg_name = cfg_path.stem
+        search_cfg = load_config(cfg_path)
+
+        config_dir = create_config_folder(run_dir, cfg_name)
+        cfg_snapshot_path = config_dir / cfg_snapshot_name
+
+        snapshot = build_config_snapshot(search_cfg, snapshot_paths)
+        save_config_snapshot(cfg_snapshot_path, snapshot)
+
+        config_run_id = create_or_get_config_run(
+            conn=conn,
+            run_id=run_id,
+            config_name=cfg_name,
+            config_path=cfg_path,
+            config_snapshot_path=cfg_snapshot_path,
+        )
+
+        registered = register_tasks(
+            conn=conn,
+            config_run_id=config_run_id,
+            df=df,
+            id_col=id_col,
+            reference_col=reference_col,
+            question_col=question_col,
+        )
+
+        logs.info(f"[{cfg_name}] registered tasks: {registered}")
+
+    refresh_run_final_status(conn, run_id)
+    return run_id
+
+
+def resume_existing_run(
+    conn: sqlite3.Connection,
+    run_dir: Path,
+    logs,
+) -> int:
+    run_row = get_run_by_dir(conn, run_dir)
+    if run_row is None:
+        raise ValueError(f"No run found in database for run_dir={run_dir}")
+
+    run_id = int(run_row["id"])
+    reset_count = reset_running_tasks_to_pending(conn)
+    if reset_count:
+        logs.info(f"Reset {reset_count} stale running tasks to pending")
+
+    update_run_status(conn, run_id, "running")
+
+    config_rows = get_config_runs_for_run(conn, run_id)
+    for cfg_row in config_rows:
+        update_config_run_status(conn, int(cfg_row["id"]), "running")
+
+    logs.info(f"Resuming run: {run_dir}")
+    return run_id
+
+
+# --------------------------------------------------
+# Processing
+# --------------------------------------------------
+
+def process_config_run(
+    conn: sqlite3.Connection,
+    config_row: sqlite3.Row,
+    max_retries: int,
+    logs,
+) -> None:
+    config_run_id = int(config_row["id"])
+    config_name = str(config_row["config_name"])
+    config_path = Path(str(config_row["config_path"]))
+
+    search_cfg = load_config(config_path)
+    pipeline = make_pipeline(search_cfg["run"]["steps"])
+
+    update_config_run_status(conn, config_run_id, "running")
+
+    initial_counts = get_task_counts_for_config(conn, config_run_id)
+    retryable = get_retryable_error_count_for_config(conn, config_run_id, max_retries)
+    logs.info(
+        f"[{config_name}] start: done={initial_counts['done']} "
+        f"pending={initial_counts['pending']} error={initial_counts['error']} "
+        f"retryable_errors={retryable}"
+    )
+
+    while True:
+        task = fetch_next_task(conn, config_run_id, max_retries)
+        if task is None:
+            break
+
+        task_id = int(task["id"])
+        source_id = int(task["source_id"])
+        question = str(task["question"])
+        current_attempts = int(task["attempt_count"])
+
+        mark_task_running(conn, task_id)
+        logs.info(
+            f"[{config_name}] processing source_id={source_id} "
+            f"attempt={current_attempts + 1}/{max_retries} | {question}"
+        )
+
+        try:
+            output: Outputs = run_query(question, pipeline, search_cfg, logs)
+
+            answer = output.answer if output.answer is not None else ""
+            raw_files = ", ".join(output.rank_html or [])
+            corrected_query = output.corrected_query or ""
+
+            mark_task_done(
+                conn=conn,
+                task_id=task_id,
+                answer=answer,
+                raw_files=raw_files,
+                corrected_query=corrected_query,
+            )
+
+        except Exception as e:
+            mark_task_error(conn, task_id, repr(e))
+            logs.exception(f"[{config_name}] failed source_id={source_id}")
+
+    final_status = refresh_config_run_final_status(conn, config_run_id, max_retries)
+    final_counts = get_task_counts_for_config(conn, config_run_id)
+    permanent_errors = get_non_retryable_error_count_for_config(conn, config_run_id, max_retries)
+
+    logs.info(
+        f"[{config_name}] finished with status={final_status} | "
+        f"done={final_counts['done']} pending={final_counts['pending']} "
+        f"running={final_counts['running']} error={final_counts['error']} "
+        f"permanent_errors={permanent_errors}"
+    )
+
+
+# --------------------------------------------------
+# CLI
+# --------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resumable batch RAG runner with SQLite")
+    parser.add_argument(
+        "--mode",
+        choices=["new", "resume"],
+        required=True,
+        help="Create a new run or resume an existing run",
+    )
+    p
