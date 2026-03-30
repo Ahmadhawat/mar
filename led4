@@ -699,4 +699,112 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Create a new run or resume an existing run",
     )
-    p
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resumable batch RAG runner with SQLite")
+    parser.add_argument(
+        "--mode",
+        choices=["new", "resume"],
+        required=True,
+        help="Create a new run or resume an existing run",
+    )
+    parser.add_argument(
+        "--config",
+        default="config/config.ledger.yaml",
+        help="Path to batch evaluation config YAML",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Existing run directory for resume mode",
+    )
+    return parser.parse_args()
+
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+
+def main():
+    args = parse_args()
+    be_cfg = load_batch_eval_config(args.config)
+    logs = get_logger("Ledger")
+
+    run_base_dir = Path(be_cfg["run_base_dir"])
+    input_xlsx = Path(be_cfg["input_xlsx"])
+    id_col = be_cfg.get("id_col", "id")
+    reference_col = be_cfg.get("reference_col", "reference")
+    question_col = be_cfg.get("question_col", "frage")
+    max_retries = int(be_cfg.get("max_retries", 3))
+    sqlite_name = be_cfg["filenames"].get("sqlite", "results.sqlite")
+
+    if args.mode == "new":
+        run_dir = create_run_folder(run_base_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        df = load_input_dataframe(input_xlsx, id_col, reference_col, question_col)
+    else:
+        if not args.run_dir:
+            raise ValueError("--run-dir is required in resume mode")
+        run_dir = Path(args.run_dir)
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+        df = None
+
+    db_path = run_dir / sqlite_name
+    conn = init_db(db_path)
+
+    try:
+        if args.mode == "new":
+            run_id = create_new_run(conn, be_cfg, run_dir, df, logs)
+        else:
+            run_id = resume_existing_run(conn, run_dir, logs)
+
+        config_rows = get_config_runs_for_run(conn, run_id)
+        if not config_rows:
+            raise RuntimeError("No config_runs found for this run.")
+
+        for config_row in config_rows:
+            process_config_run(
+                conn=conn,
+                config_row=config_row,
+                max_retries=max_retries,
+                logs=logs,
+            )
+
+        final_run_status = refresh_run_final_status(conn, run_id)
+        logs.info(f"Run finished with status={final_run_status}")
+        logs.info(f"Run directory: {run_dir}")
+        logs.info(f"SQLite DB: {db_path}")
+
+    except Exception:
+        run_row = get_run_by_dir(conn, run_dir)
+        if run_row is not None:
+            update_run_status(conn, int(run_row["id"]), "failed")
+        logs.exception("Batch run failed")
+        raise
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+python batch_eval.py --mode new
+python batch_eval.py --mode resume --run-dir runs/run_20260329_154500
