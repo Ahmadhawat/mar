@@ -1,0 +1,569 @@
+import json
+import re
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Tuple
+import requests
+import html2text
+from tqdm import tqdm
+from difflib import SequenceMatcher
+
+# =========================
+# Configuration
+# =========================
+DB_PATH = "./rag_dataset.db"
+API_URL = "http://ai.ibtad.ibtnet.de:11434/api/generate"
+MODEL_NAME = "gpt-oss:20b"
+
+TIMEOUT = 240
+MAX_CONTEXT_CHARS = 18000     # judge bekommt gekürzten Kontext
+MIN_ANSWER_LEN = 20
+MIN_QUESTION_LEN = 8
+FORCE_REEVAL = False          # True = alles neu bewerten
+EXPORT_ONLY_KEEP = True
+MAX_PER_DOC = 3               # max. Q&A pro Dokument im finalen Export
+MIN_TOTAL_SCORE = 6           # Mindestscore für final keep
+REQUIRE_GROUNDEDNESS = 2      # Antwort muss klar im Dokument sein
+DUPLICATE_THRESHOLD = 0.90    # text similarity für near-duplicate
+OUTPUT_JSON = "curated_eval_dataset.json"
+
+# =========================
+# Helpers
+# =========================
+def query_ollama(url: str, model: str, prompt: str, timeout: int = TIMEOUT) -> str:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": 25000,
+        },
+    }
+    resp = requests.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["response"]
+
+
+def html_to_text(html_content: str) -> str:
+    conv = html2text.HTML2Text()
+    conv.ignore_links = False
+    conv.body_width = 0
+    conv.ignore_images = True
+    conv.ignore_emphasis = False
+    text = conv.handle(html_content)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def clean_answer(answer: str) -> str:
+    """
+    Entfernt typische Quellen-Anhänge / Pfade / Meta-Sätze aus generierten Antworten.
+    """
+    if not answer:
+        return ""
+
+    cleaned = answer.strip()
+
+    # Häufige Muster entfernen
+    patterns = [
+        r"\*\*?Am Ende der Antwort.*?$",
+        r"\*\*?Link zur Quelle.*?$",
+        r"Link zur Quelle:.*?$",
+        r"Quelle:.*?$",
+        r"Pfad:.*?$",
+        r"C:\\Users\\.*?$",
+        r"/.*?\.htm[l]?$",
+    ]
+    for p in patterns:
+        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    # Mehrfach-Leerzeilen reduzieren
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\wäöüß ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
+
+
+def shorten_context(text: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... gekürzt ...]"
+
+
+def extract_json_block(text: str) -> Dict[str, Any]:
+    """
+    Versucht JSON robust aus Modellantwort zu extrahieren.
+    """
+    text = text.strip()
+
+    # zuerst direkte JSON-Antwort versuchen
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # JSON-Block suchen
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError(f"Kein JSON gefunden:\n{text}")
+
+    block = match.group(0)
+    return json.loads(block)
+
+
+def classify_duplicate_flag(
+    current_question: str,
+    existing_questions_same_doc: List[str],
+) -> Tuple[int, Optional[str]]:
+    for q in existing_questions_same_doc:
+        if similarity(current_question, q) >= DUPLICATE_THRESHOLD:
+            return 1, q
+    return 0, None
+
+
+# =========================
+# DB setup
+# =========================
+def ensure_eval_table(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rag_eval (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            answer_row_id INTEGER UNIQUE,
+            doc_id TEXT,
+            question_id INTEGER,
+            reference TEXT,
+            question TEXT,
+            cleaned_answer TEXT,
+            question_type TEXT,
+            groundedness_score INTEGER,
+            question_quality_score INTEGER,
+            answer_quality_score INTEGER,
+            retrieval_value_score INTEGER,
+            duplicate_flag INTEGER,
+            total_score INTEGER,
+            keep INTEGER,
+            judge_reason TEXT,
+            duplicate_with TEXT,
+            created_at TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+
+def load_answer_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    if FORCE_REEVAL:
+        cur.execute("""
+            SELECT id, doc_id, question_id, reference, question, answer, created_at
+            FROM rag_answers
+            ORDER BY id
+        """)
+    else:
+        cur.execute("""
+            SELECT a.id, a.doc_id, a.question_id, a.reference, a.question, a.answer, a.created_at
+            FROM rag_answers a
+            LEFT JOIN rag_eval e ON e.answer_row_id = a.id
+            WHERE e.answer_row_id IS NULL
+            ORDER BY a.id
+        """)
+
+    return cur.fetchall()
+
+
+def get_all_questions_for_doc(conn: sqlite3.Connection, doc_id: str, current_row_id: int) -> List[str]:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT question
+        FROM rag_answers
+        WHERE doc_id = ?
+          AND id < ?
+        ORDER BY id
+    """, (doc_id, current_row_id))
+    rows = cur.fetchall()
+    return [r["question"] for r in rows if r["question"]]
+
+
+def save_eval(
+    conn: sqlite3.Connection,
+    answer_row_id: int,
+    doc_id: str,
+    question_id: int,
+    reference: str,
+    question: str,
+    cleaned_answer: str,
+    judge: Dict[str, Any],
+    duplicate_flag: int,
+    duplicate_with: Optional[str],
+) -> None:
+    cur = conn.cursor()
+
+    groundedness = int(judge.get("groundedness_score", 0))
+    question_quality = int(judge.get("question_quality_score", 0))
+    answer_quality = int(judge.get("answer_quality_score", 0))
+    retrieval_value = int(judge.get("retrieval_value_score", 0))
+    question_type = str(judge.get("question_type", "unknown")).strip().lower()
+    keep = int(judge.get("keep", 0))
+    judge_reason = str(judge.get("reason", "")).strip()
+
+    total_score = groundedness + question_quality + answer_quality + retrieval_value - duplicate_flag
+
+    # harte Regeln für keep
+    if groundedness < REQUIRE_GROUNDEDNESS:
+        keep = 0
+    if total_score < MIN_TOTAL_SCORE:
+        keep = 0
+    if duplicate_flag == 1:
+        keep = 0
+
+    cur.execute("""
+        INSERT OR REPLACE INTO rag_eval (
+            answer_row_id, doc_id, question_id, reference, question, cleaned_answer,
+            question_type, groundedness_score, question_quality_score, answer_quality_score,
+            retrieval_value_score, duplicate_flag, total_score, keep, judge_reason,
+            duplicate_with, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        answer_row_id,
+        doc_id,
+        question_id,
+        reference,
+        question,
+        cleaned_answer,
+        question_type,
+        groundedness,
+        question_quality,
+        answer_quality,
+        retrieval_value,
+        duplicate_flag,
+        total_score,
+        keep,
+        judge_reason,
+        duplicate_with,
+        datetime.now(),
+    ))
+    conn.commit()
+
+
+# =========================
+# Judge prompt
+# =========================
+def build_judge_prompt(question: str, answer: str, context: str) -> str:
+    return f"""
+Du bewertest ein automatisch erzeugtes Frage-Antwort-Paar für ein späteres RAG-Testset.
+
+Wichtig:
+- Beurteile nur anhand des gegebenen Kontexts.
+- Nutze kein externes Wissen.
+- Gib NUR gültiges JSON zurück.
+- Keine Markdown-Blöcke.
+- Keine Erklärung außerhalb des JSON.
+
+Bewertungskriterien:
+
+1. groundedness_score (0-2)
+- 2: Die Antwort ist klar und direkt im Kontext belegt.
+- 1: Teilweise belegt / etwas unscharf / teilweise Interpretation.
+- 0: Nicht sauber im Kontext belegt oder halluziniert.
+
+2. question_quality_score (0-2)
+- 2: realistische, klare, nützliche Nutzerfrage
+- 1: okay, aber etwas generisch / trivial / unklar
+- 0: ungeeignet, unnatürlich oder sehr schlecht formuliert
+
+3. answer_quality_score (0-2)
+- 2: präzise, korrekt, kurz, vollständig genug
+- 1: teilweise okay, aber etwas vage / unnötig lang / ungeschickt
+- 0: schlecht, falsch, unklar oder unbrauchbar
+
+4. retrieval_value_score (0-2)
+- 2: gute Frage für späteren RAG-Test; sinnvoller Retrieval-Fall
+- 1: mittelmäßig; beantwortbar, aber wenig anspruchsvoll
+- 0: sehr trivial / kaum sinnvoll für Retrieval-Evaluation
+
+5. question_type
+Erlaube nur einen dieser Werte:
+- how_to
+- troubleshooting
+- configuration
+- fact
+- navigation
+- other
+
+6. keep
+- true nur wenn das Paar wirklich für ein späteres Testset geeignet ist
+- false sonst
+
+JSON-Schema:
+{{
+  "groundedness_score": 0,
+  "question_quality_score": 0,
+  "answer_quality_score": 0,
+  "retrieval_value_score": 0,
+  "question_type": "how_to",
+  "keep": false,
+  "reason": "kurze Begründung auf Deutsch"
+}}
+
+Frage:
+{question}
+
+Antwort:
+{answer}
+
+Kontext:
+{context}
+""".strip()
+
+
+def judge_qa(question: str, answer: str, context: str) -> Dict[str, Any]:
+    prompt = build_judge_prompt(question, answer, context)
+    raw = query_ollama(API_URL, MODEL_NAME, prompt)
+    data = extract_json_block(raw)
+
+    # leichte Absicherung
+    allowed_types = {"how_to", "troubleshooting", "configuration", "fact", "navigation", "other"}
+    if data.get("question_type") not in allowed_types:
+        data["question_type"] = "other"
+
+    for key in [
+        "groundedness_score",
+        "question_quality_score",
+        "answer_quality_score",
+        "retrieval_value_score",
+    ]:
+        try:
+            val = int(data.get(key, 0))
+        except Exception:
+            val = 0
+        data[key] = max(0, min(2, val))
+
+    data["keep"] = bool(data.get("keep", False))
+    data["reason"] = str(data.get("reason", "")).strip()
+
+    return data
+
+
+# =========================
+# Export
+# =========================
+def export_curated_dataset(conn: sqlite3.Connection, output_path: str) -> None:
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM rag_eval
+        WHERE keep = 1
+        ORDER BY total_score DESC, groundedness_score DESC, answer_row_id ASC
+    """)
+    rows = cur.fetchall()
+
+    # max pro doc begrenzen
+    per_doc_count: Dict[str, int] = {}
+    final_rows = []
+
+    for row in rows:
+        doc_id = row["doc_id"]
+        count = per_doc_count.get(doc_id, 0)
+        if count >= MAX_PER_DOC:
+            continue
+        per_doc_count[doc_id] = count + 1
+        final_rows.append(row)
+
+    export_data = []
+    for r in final_rows:
+        export_data.append({
+            "answer_row_id": r["answer_row_id"],
+            "doc_id": r["doc_id"],
+            "question_id": r["question_id"],
+            "reference": r["reference"],
+            "question": r["question"],
+            "gold_answer": r["cleaned_answer"],
+            "question_type": r["question_type"],
+            "groundedness_score": r["groundedness_score"],
+            "question_quality_score": r["question_quality_score"],
+            "answer_quality_score": r["answer_quality_score"],
+            "retrieval_value_score": r["retrieval_value_score"],
+            "duplicate_flag": r["duplicate_flag"],
+            "total_score": r["total_score"],
+            "judge_reason": r["judge_reason"],
+        })
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+    print(f"\nExport gespeichert: {output_path}")
+    print(f"Finale Anzahl Q&A im kuratierten Set: {len(export_data)}")
+
+
+def print_summary(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM rag_answers")
+    total_answers = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM rag_eval")
+    total_eval = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM rag_eval WHERE keep = 1")
+    kept = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT question_type, COUNT(*)
+        FROM rag_eval
+        WHERE keep = 1
+        GROUP BY question_type
+        ORDER BY COUNT(*) DESC
+    """)
+    type_rows = cur.fetchall()
+
+    print("\n===== Zusammenfassung =====")
+    print(f"Q&A in rag_answers: {total_answers}")
+    print(f"Bewertete Q&A: {total_eval}")
+    print(f"Behaltene Q&A: {kept}")
+    print("Verteilung question_type (keep=1):")
+    for qt, cnt in type_rows:
+        print(f"  - {qt}: {cnt}")
+
+
+# =========================
+# Main
+# =========================
+def main():
+    conn = sqlite3.connect(DB_PATH)
+    ensure_eval_table(conn)
+
+    rows = load_answer_rows(conn)
+    if not rows:
+        print("Keine neuen Q&A zum Bewerten gefunden.")
+        print_summary(conn)
+        export_curated_dataset(conn, OUTPUT_JSON)
+        conn.close()
+        return
+
+    print(f"{len(rows)} Q&A werden bewertet...")
+
+    for row in tqdm(rows, desc="Bewerte Q&A"):
+        answer_row_id = row["id"]
+        doc_id = row["doc_id"]
+        question_id = row["question_id"]
+        reference = row["reference"]
+        question = (row["question"] or "").strip()
+        raw_answer = (row["answer"] or "").strip()
+
+        # sehr einfache Vorfilter
+        cleaned_answer = clean_answer(raw_answer)
+        if len(question) < MIN_QUESTION_LEN:
+            judge = {
+                "groundedness_score": 0,
+                "question_quality_score": 0,
+                "answer_quality_score": 0,
+                "retrieval_value_score": 0,
+                "question_type": "other",
+                "keep": False,
+                "reason": "Frage zu kurz oder unbrauchbar.",
+            }
+            save_eval(conn, answer_row_id, doc_id, question_id, reference, question, cleaned_answer, judge, 0, None)
+            continue
+
+        if len(cleaned_answer) < MIN_ANSWER_LEN:
+            judge = {
+                "groundedness_score": 0,
+                "question_quality_score": 1,
+                "answer_quality_score": 0,
+                "retrieval_value_score": 0,
+                "question_type": "other",
+                "keep": False,
+                "reason": "Antwort zu kurz oder unbrauchbar.",
+            }
+            save_eval(conn, answer_row_id, doc_id, question_id, reference, question, cleaned_answer, judge, 0, None)
+            continue
+
+        # near-duplicate pro Dokument
+        previous_questions = get_all_questions_for_doc(conn, doc_id, answer_row_id)
+        duplicate_flag, duplicate_with = classify_duplicate_flag(question, previous_questions)
+
+        # Kontext laden
+        html_path = Path(reference)
+        if not html_path.exists():
+            judge = {
+                "groundedness_score": 0,
+                "question_quality_score": 1,
+                "answer_quality_score": 0,
+                "retrieval_value_score": 0,
+                "question_type": "other",
+                "keep": False,
+                "reason": f"Quelldatei fehlt: {reference}",
+            }
+            save_eval(conn, answer_row_id, doc_id, question_id, reference, question, cleaned_answer, judge, duplicate_flag, duplicate_with)
+            continue
+
+        try:
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            doc_text = html_to_text(html_content)
+            context = shorten_context(doc_text)
+        except Exception as e:
+            judge = {
+                "groundedness_score": 0,
+                "question_quality_score": 1,
+                "answer_quality_score": 0,
+                "retrieval_value_score": 0,
+                "question_type": "other",
+                "keep": False,
+                "reason": f"Fehler beim Lesen/Verarbeiten der Quelle: {e}",
+            }
+            save_eval(conn, answer_row_id, doc_id, question_id, reference, question, cleaned_answer, judge, duplicate_flag, duplicate_with)
+            continue
+
+        try:
+            judge = judge_qa(question, cleaned_answer, context)
+        except Exception as e:
+            judge = {
+                "groundedness_score": 0,
+                "question_quality_score": 1,
+                "answer_quality_score": 0,
+                "retrieval_value_score": 0,
+                "question_type": "other",
+                "keep": False,
+                "reason": f"Judge-Fehler: {e}",
+            }
+
+        save_eval(
+            conn=conn,
+            answer_row_id=answer_row_id,
+            doc_id=doc_id,
+            question_id=question_id,
+            reference=reference,
+            question=question,
+            cleaned_answer=cleaned_answer,
+            judge=judge,
+            duplicate_flag=duplicate_flag,
+            duplicate_with=duplicate_with,
+        )
+
+    print_summary(conn)
+    export_curated_dataset(conn, OUTPUT_JSON)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
