@@ -1,0 +1,19 @@
+batch_eval:
+  run_base_dir: runs
+  input_xlsx: data/questions.xlsx
+
+  id_col: id
+  reference_col: reference
+  question_col: frage
+
+  search_config_folder: config/search
+  max_retries: 3
+
+  filenames:
+    config_snapshot: config_snapshot.yaml
+    sqlite: results.sqlite
+
+  snapshot_paths:
+    - run.steps
+    - retrieval.top_k
+    - llm.model
